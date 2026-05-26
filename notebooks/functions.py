@@ -2,6 +2,7 @@
 
 import numpy as np
 import cvxpy as cp
+from tqdm import tqdm
 import torch
 from torch.autograd import Function
 
@@ -201,3 +202,34 @@ class SPOPlus(Function):
         )
     
 
+def compute_loss_normalization(model, train_loader, solver, criterion):
+    '''
+    Compute the normalization factors of the two losses SPO+ and MSE to make them comparable for training with a combined loss.
+    Take the average loss over all losses computed from the batches of the whole training set.
+    '''
+    model.train()
+    spo_vals = []
+    mse_vals = []
+
+    with torch.no_grad():  # no updates in this pass, just loss computation
+        for X_batch, Y_batch, oracle_batch in tqdm(train_loader):
+            predictions = model(X_batch)
+
+            spo_losses = []
+            for i in range(X_batch.shape[0]):
+                loss_i = SPOPlus.apply(
+                    predictions[i],
+                    Y_batch[i],
+                    oracle_batch[i],
+                    solver
+                )
+                spo_losses.append(loss_i.item())
+
+            spo_vals.append(np.mean(spo_losses))
+            mse_vals.append(criterion(predictions, Y_batch).item())
+
+    # fix normalization constants: absolute value since SPO+ is negative
+    spo_scale = abs(np.mean(spo_vals))
+    mse_scale = abs(np.mean(mse_vals))
+
+    return spo_scale, mse_scale
