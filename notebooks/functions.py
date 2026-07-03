@@ -4,6 +4,7 @@ import numpy as np
 import cvxpy as cp
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 from torch.autograd import Function
 
 def create_time_series_data_with_lags(return_matrix, max_lag=3):
@@ -49,8 +50,8 @@ class CVaRSolver:
         self.S = S
         self.beta = beta
 
-        # expected return parameter
-        self.mu = cp.Parameter(N)
+        # expected loss parameter
+        self.c = cp.Parameter(N)
 
         # optimization variables
         self.w = cp.Variable(N)
@@ -79,8 +80,8 @@ class CVaRSolver:
             <= self.beta
         ]
 
-        objective = cp.Maximize(
-            self.mu @ self.w
+        objective = cp.Minimize(
+            self.c @ self.w
         )
 
         self.problem = cp.Problem(
@@ -89,9 +90,9 @@ class CVaRSolver:
         )
 
 
-    def solve(self, mu):
+    def solve(self, c):
 
-        self.mu.value = np.asarray(mu)
+        self.c.value = np.asarray(c)
 
         self.problem.solve(
             solver=cp.HIGHS,
@@ -144,8 +145,8 @@ class CVaRSolver:
             *100
         )
 
-        portfolio_return = (
-            self.mu.value @ w
+        portfolio_return = - (
+            self.c.value @ w
             *100
         )
 
@@ -158,48 +159,68 @@ class CVaRSolver:
 class SPOPlus(Function):
 
     @staticmethod
-    def forward(ctx, mu_hat, mu_true, oracle_w, solver):
+    def forward(ctx, c_hat, c_true, oracle_w, solver):
         """
-        mu_hat:   predicted returns [N]
-        mu_true:  true returns [N]
-        oracle_w: precomputed w*(mu_true) [N]
+        c_hat:   predicted costs (negative returns) [N]
+        c_true:  true costs [N]
+        oracle_w: precomputed w*(- mu_true) [N]
         solver:   CVaR solver (only used for perturbed solve now)
         """
 
         # oracle_w is precomputed
 
         # perturbed solve
-        mu_hat_np = mu_hat.detach().cpu().numpy()
-        mu_true_np = mu_true.detach().cpu().numpy()
-        perturbed_mu = 2 * mu_hat_np - mu_true_np
-        perturbed_w = solver.solve(perturbed_mu)
+        c_hat_np = c_hat.detach().cpu().numpy()
+        c_true_np = c_true.detach().cpu().numpy()
+        # perturbed_c = c_true_np + 15 * (c_hat_np - c_true_np)       # !!!!!! increased perturubation strength
+        perturbed_c = 2 * c_hat_np - c_true_np 
+        perturbed_w = solver.solve(perturbed_c)
         perturbed_w = torch.tensor(
             perturbed_w,
-            dtype=mu_hat.dtype,
-            device=mu_hat.device
+            dtype=c_hat.dtype,
+            device=c_hat.device
         )
 
         ctx.save_for_backward(oracle_w, perturbed_w)
 
+        # loss = (
+        #     torch.dot(c_true, perturbed_w)
+        #     - torch.dot(c_true, oracle_w)
+        # )
         loss = (
-            -torch.dot(perturbed_w, mu_true)
-            + 2 * torch.dot(mu_hat, oracle_w)
-            - torch.dot(oracle_w, mu_true)
+            2 * torch.dot(c_hat, oracle_w)
+            - torch.dot(c_true, oracle_w)
+            - torch.dot(2 * c_hat - c_true, perturbed_w)
         )
-
+                                    
         return loss
 
     @staticmethod
     def backward(ctx, grad_output):
         oracle_w, perturbed_w = ctx.saved_tensors
-        grad_mu_hat = 2 * (oracle_w - perturbed_w)
+        grad_mu_hat = 2 * (oracle_w - perturbed_w)  
 
         return (
             grad_output * grad_mu_hat,
-            None,   # mu_true
+            None,   # c_true
             None,   # oracle_w
             None,   # solver
         )
+    
+class VARasNN(nn.Module):
+
+    def __init__(self,input_dim,output_dim):
+
+        super().__init__()
+
+        self.linear = nn.Linear(
+            input_dim,
+            output_dim
+        )
+
+    def forward(self,x):
+
+        return self.linear(x)
     
 
 def compute_loss_normalization(model, train_loader, solver, criterion):
@@ -212,14 +233,14 @@ def compute_loss_normalization(model, train_loader, solver, criterion):
     mse_vals = []
 
     with torch.no_grad():  # no updates in this pass, just loss computation
-        for X_batch, Y_batch, oracle_batch in tqdm(train_loader):
+        for X_batch, Y_batch, oracle_batch in tqdm(train_loader, desc="Computing loss scales for normalization"):
             predictions = model(X_batch)
 
             spo_losses = []
             for i in range(X_batch.shape[0]):
                 loss_i = SPOPlus.apply(
-                    predictions[i],
-                    Y_batch[i],
+                    - predictions[i],           # c_hat
+                    - Y_batch[i],               # c_true
                     oracle_batch[i],
                     solver
                 )
@@ -228,8 +249,122 @@ def compute_loss_normalization(model, train_loader, solver, criterion):
             spo_vals.append(np.mean(spo_losses))
             mse_vals.append(criterion(predictions, Y_batch).item())
 
-    # fix normalization constants: absolute value since SPO+ is negative
-    spo_scale = abs(np.mean(spo_vals))
-    mse_scale = abs(np.mean(mse_vals))
+    spo_scale = np.mean(spo_vals)
+    mse_scale = np.mean(mse_vals)
 
     return spo_scale, mse_scale
+
+def create_train_test_split(X, Y, test_index, val_length=3):
+    # Create train/test split and scenario loss matrix for CVaR computation.
+
+    X_train = X[:-(test_index + val_length)] # take all rows up to the test_index last row minus the val_length for training
+    X_val = X[-(test_index + val_length): -test_index] # take rows inbetween for validation
+    X_test = X[-test_index] # take the test_index last row for testing
+
+    Y_train = Y[:-(test_index + val_length)]
+    Y_val = Y[-(test_index + val_length): -test_index]
+    Y_test = Y[-test_index]
+
+    return X_train, X_val, X_test, Y_train, Y_val, Y_test
+
+
+def get_scenario_loss_matrix(return_matrix, test_index, num_scenarios=1000, random_seed=42):
+    # Need return matrix because otherwise the first max_lag entries are excluded.
+    # Perform bootstrap for return scenarios on the training period
+    return_array = return_matrix[:-test_index].values
+
+    np.random.seed(random_seed)
+    # Sample row indices with replacement
+    sample_indices = np.random.choice(return_array.shape[0], size=num_scenarios, replace=True)
+    # Generate bootstrapped scenario loss matrix
+    scenario_loss_matrix = -return_array[sample_indices, :]
+
+    return scenario_loss_matrix
+
+def train_model(model, n_epochs, train_loader, optimizer, criterion, solver, spo_scale, mse_scale, gamma):
+
+    history = {
+        "combined_loss": [],
+        "spo_loss": [],
+        "mse_loss": []
+    }
+
+    for epoch in tqdm(range(n_epochs), desc="epochs"):
+
+        model.train()
+
+        epoch_spo_loss = 0.0
+        epoch_mse_loss = 0.0
+        epoch_combined_loss = 0.0
+
+        for X_batch, Y_batch, oracle_batch in train_loader:
+
+            optimizer.zero_grad()
+
+            predictions = model(X_batch)
+
+            spo_losses = []
+            for i in range(X_batch.shape[0]):
+
+                loss_i = SPOPlus.apply(
+                    - predictions[i],           # c_hat
+                    - Y_batch[i],               # c_true
+                    oracle_batch[i],
+                    solver
+                )
+
+                spo_losses.append(loss_i)
+
+            spo_loss = torch.stack(spo_losses).mean()
+            spo_loss_scaled = spo_loss / spo_scale
+
+            mse_loss = criterion(predictions, Y_batch)
+            mse_loss_scaled = mse_loss / mse_scale
+
+            loss = (
+                gamma * (spo_loss_scaled)
+                + (1 - gamma) * (mse_loss_scaled)
+            )
+
+            loss.backward()
+
+            # Log gradients every first batch of each epoch
+            # if len(history["combined_loss"]) == 0 or True:  # or gate by batch index
+            #     for name, param in model.named_parameters():
+            #         if param.grad is not None:
+            #             print(f"  {name}: grad_norm={param.grad.norm().item():.6f}, grad_mean={param.grad.mean().item():.6f}")
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+
+            epoch_spo_loss += spo_loss_scaled.item()
+            epoch_mse_loss += mse_loss_scaled.item()
+            epoch_combined_loss += loss.item()
+
+        n_batches = len(train_loader)
+
+        avg_spo = epoch_spo_loss / n_batches
+        avg_mse = epoch_mse_loss / n_batches
+        avg_combined = epoch_combined_loss / n_batches
+
+        # Compute the validation regret for early stopping
+
+
+        # ---------------
+
+        history["spo_loss"].append(avg_spo)
+        history["mse_loss"].append(avg_mse)
+        history["combined_loss"].append(avg_combined)
+
+        print(
+            f"Epoch {epoch+1}: "
+            f"combined={avg_combined:.6f} | "
+            f"SPO+ scaled={avg_spo:.6f} | "
+            f"MSE scaled={avg_mse:.6f}"
+            # f"SPO+ ={avg_spo:.6f} | "
+            # f"MSE ={avg_mse:.6f}"
+        )
+
+    return history
