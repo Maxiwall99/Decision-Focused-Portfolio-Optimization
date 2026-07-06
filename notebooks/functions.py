@@ -6,6 +6,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.autograd import Function
+import copy
 
 def create_time_series_data_with_lags(return_matrix, max_lag=3):
     # Create training and test data for the prediction model.
@@ -268,10 +269,10 @@ def create_train_test_split(X, Y, test_index, val_length=3):
     return X_train, X_val, X_test, Y_train, Y_val, Y_test
 
 
-def get_scenario_loss_matrix(return_matrix, test_index, num_scenarios=1000, random_seed=42):
+def get_scenario_loss_matrix(return_matrix, index, num_scenarios=1000, random_seed=42):
     # Need return matrix because otherwise the first max_lag entries are excluded.
-    # Perform bootstrap for return scenarios on the training period
-    return_array = return_matrix[:-test_index].values
+    # Perform bootstrap for return scenarios on the training period (excluding validation and test period)
+    return_array = return_matrix[:-index].values
 
     np.random.seed(random_seed)
     # Sample row indices with replacement
@@ -281,13 +282,20 @@ def get_scenario_loss_matrix(return_matrix, test_index, num_scenarios=1000, rand
 
     return scenario_loss_matrix
 
-def train_model(model, n_epochs, train_loader, optimizer, criterion, solver, spo_scale, mse_scale, gamma):
+def train_model(model, n_epochs, train_loader, optimizer, criterion, solver, spo_scale, mse_scale, gamma, val_X, val_Y, oracle_val_tensor, early_stopping_patience):
 
     history = {
         "combined_loss": [],
         "spo_loss": [],
-        "mse_loss": []
+        "mse_loss": [],
+        "val_regret": [],
+        "early_stopping_epoch": int,
+        "best_epoch": int,
     }
+
+    best_val_regret = float("inf")
+    best_model_state = None
+    epochs_without_improvement = 0
 
     for epoch in tqdm(range(n_epochs), desc="epochs"):
 
@@ -349,22 +357,53 @@ def train_model(model, n_epochs, train_loader, optimizer, criterion, solver, spo
         avg_mse = epoch_mse_loss / n_batches
         avg_combined = epoch_combined_loss / n_batches
 
-        # Compute the validation regret for early stopping
+        # Compute the validation regret for early stopping─
+        model.eval()
+        total_regret = 0.0
 
+        with torch.no_grad():
+            for i in range(len(val_X)):
+                y_hat = model(val_X[i]).numpy()
+                y_true = val_Y[i].numpy()
 
-        # ---------------
+                w_hat  = solver.solve(-y_hat)
+                w_star = oracle_val_tensor[i].numpy()
+
+                total_regret += float(y_true @ w_star - y_true @ w_hat)
+
+        avg_val_regret = total_regret / len(val_X)
+
+        if avg_val_regret < best_val_regret:
+            best_val_regret = avg_val_regret
+            best_model_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         history["spo_loss"].append(avg_spo)
         history["mse_loss"].append(avg_mse)
         history["combined_loss"].append(avg_combined)
+        history["val_regret"].append(avg_val_regret)
 
         print(
             f"Epoch {epoch+1}: "
             f"combined={avg_combined:.6f} | "
             f"SPO+ scaled={avg_spo:.6f} | "
-            f"MSE scaled={avg_mse:.6f}"
-            # f"SPO+ ={avg_spo:.6f} | "
-            # f"MSE ={avg_mse:.6f}"
+            f"MSE scaled={avg_mse:.6f} | "
+            f"val_regret={avg_val_regret:.6f}"
+            f"{'  ✓ regret improved' if epochs_without_improvement == 0 else ''}"
         )
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(f"Early stopping at epoch {epoch+1}. Best val regret: {best_val_regret:.6f}")
+
+            history["early_stopping_epoch"] = epoch+1
+            history["best_epoch"] = epoch+1 - early_stopping_patience
+
+            break
+
+    # restore weights from best epoch
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
     return history
