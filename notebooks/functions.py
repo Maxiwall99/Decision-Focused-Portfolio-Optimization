@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.autograd import Function
 import copy
 
-def create_time_series_data_with_lags(return_matrix, max_lag=3):
+def create_time_series_data_with_lags(return_matrix, max_lag):
     # Create training and test data for the prediction model.
     # Every entry of X are the return series of the last {max_lag} months.
     # The corresponding entry in Y is always the return series next closest afterwards.
@@ -16,7 +16,6 @@ def create_time_series_data_with_lags(return_matrix, max_lag=3):
     X = []
     Y = []
 
-    max_lag = 3
     n_rows = len(return_matrix)
 
     n = max_lag
@@ -289,15 +288,15 @@ def train_model(model, n_epochs, train_loader, optimizer, criterion, solver, spo
         "spo_loss": [],
         "mse_loss": [],
         "val_regret": [],
-        "early_stopping_epoch": int,
-        "best_epoch": int,
+        "early_stopping_epoch": None,
+        "best_epoch": None,
     }
 
     best_val_regret = float("inf")
     best_model_state = None
     epochs_without_improvement = 0
 
-    for epoch in tqdm(range(n_epochs), desc="epochs"):
+    for epoch in range(n_epochs):
 
         model.train()
 
